@@ -1,0 +1,754 @@
+
+# PhantomIO — C-based High-Performance Cross-Platform Input & Overlay Library (Complete, detailed)
+
+> **Short summary:** PhantomIO is a cross-platform C library for ultra-fast virtual input, system control, and GPU overlays. Designed for maximum speed, multi-monitor support, and offline operation, it provides a stable C ABI with bindings for other languages.
+---
+
+# 0. Goals (restated precisely)
+
+* Provide a reusable cross-platform library/SDK that:
+
+  * Controls a program-managed cursor/keyboard independently of the system cursor.
+  * Renders visual overlays per-monitor with GPU acceleration.
+  * Exposes system information similar to PyWin32.
+  * Controls the host machine (keyboard/mouse input) via best-effort window-targeted injection and optional virtual devices.
+  * Works across multiple monitors and when target windows are minimized (visual overlay mode).
+  * Is a library (not an app) with stable C ABI suitable for bindings (Python, Node, C#).
+  * Maximizes performance (low latency, high throughput) while remaining maintainable and secure.
+
+* Primary implementation language: **C**. Use inline assembly / compiler intrinsics where beneficial.
+
+---
+
+# 1. High-level architecture
+
+```
+User app (bindings)  <-->  C library core (core/*.c)  <-->  backend (per-OS)
+                                    \
+                                     -> privileged helper / driver (optional)
+                                          - mmap'ed ring buffer / doorbell
+                                          - DMA-capable buffers (if supported)
+```
+
+Components:
+
+1. **Core C library (core/)**
+
+   * Platform-agnostic logic: ring buffer API, batching scheduler, thread management, JSON config parsing, error handling, logging, tests.
+
+2. **ABI shim (abi/)**
+
+   * Stable C headers (well-documented). Exposes `robo_*` API (or user-chosen prefix). Keeps binary/ABI stability.
+
+3. **Backends (backends/)**
+
+   * OS-specific overlays, injection paths:
+
+     * Windows: CreateFileMapping / MapViewOfFile, DeviceIoControl doorbell, DirectComposition/D3D overlay, optional KMDF driver interface.
+     * Linux: uinput batching, `mmap()`ed helper, `eventfd` or ioctl doorbell, X11 / Wayland overlay paths, DRM/KMS direct scanout option.
+     * macOS: DriverKit / IOHIDUserDevice helper, IOConnectMapMemory64, CoreGraphics/Metal overlay.
+
+4. **Drivers / privileged helper (drivers/)**
+
+   * Optional signed kernel modules or user-space privileged helper exposing `mmap()` and a tiny doorbell interface (eventfd/IOCTL/DeviceIoControl), minimal attack surface.
+
+5. **Bindings (bindings/)**
+
+   * Python CFFI/ctypes wrapper, Node N-API, C# P/Invoke wrapper.
+
+6. **Examples & tools (examples/, tools/)**
+
+   * PoC apps: overlay-only visual cursor, batched-injector, latency microbench, stress tests, build tools, installer scripts.
+
+---
+
+# 2. Design principles & constraints
+
+* **C ABI first:** Keep C header surface stable; internal code may be modularized but ABI must be stable across minor versions.
+* **Minimal privileged footprint:** All privileged behavior isolated in small helpers or drivers; library works in degraded mode without privileged helper.
+* **Batching & zero-copy:** Reduce syscall overhead by batching multiple events and by using shared memory ring buffers to avoid per-event copies.
+* **Deterministic small reports:** Prepack HID reports in user land, keep fixed, small sizes for cache locality and predictable DMA behavior.
+* **Real-time threads & CPU pinning:** Allow critical injection/compositor threads to be pinned and prioritized to reduce jitter.
+* **Graceful fallback:** If privileged helper absent, use single-event syscalls (uinput writes or native OS event APIs) as fallback.
+* **Security-first:** Validate all mmap bounds, authenticate clients to privileged helpers, enforce capability checks, sign drivers where required.
+
+---
+
+# 3. Core C ABI (complete, authoritative)
+
+All functions return `0` on success; negative integers are errors (well-defined error codes).
+
+Primary opaque types:
+
+```c
+typedef struct robo_ctx_t robo_ctx_t;
+typedef struct robo_dev_t  robo_dev_t;
+typedef struct robo_ovl_t  robo_ovl_t;
+```
+
+Core lifecycle & operations (full API set, with argument descriptions):
+
+```c
+// ---------------------------------------------------------------------
+// Initialization / lifecycle
+// ---------------------------------------------------------------------
+
+// Initialize library using JSON config (NULL = defaults).
+// On success returns 0 and sets *ctx.
+int robo_init(const char *config_json, robo_ctx_t **ctx);
+
+// Graceful shutdown; blocks until background threads exit.
+void robo_shutdown(robo_ctx_t *ctx);
+
+// Diagnostics: returns allocated JSON string (caller frees with free()).
+int robo_benchmark_latency(robo_ctx_t *ctx, char **out_json);
+
+// ---------------------------------------------------------------------
+// Overlays (visual-only, per-monitor or window)
+// ---------------------------------------------------------------------
+
+// monitor_spec: e.g., "primary", "monitor:1", "window:0x12345", or NULL for default.
+// Creates a transparent GPU-accelerated overlay. Caller obtains overlay handle.
+int robo_overlay_create(robo_ctx_t *ctx, const char *monitor_spec, robo_ovl_t **out);
+
+// Set a cursor image for overlay in RGBA premultiplied bytes.
+// rgba: pointer to w*h*4 bytes; w,h: dimensions; hotspot_x/y: anchor in image.
+// Copies image (or may take ownership depending on flags in future).
+int robo_overlay_set_cursor_image(robo_ovl_t *h, const uint8_t *rgba, int w, int h, int hotspot_x, int hotspot_y);
+
+// Move overlay virtual cursor to screen coords x,y (logical screen space).
+int robo_overlay_move(robo_ovl_t *h, int x, int y);
+
+// Optionally set overlay opacity, z-order, etc.
+int robo_overlay_set_opacity(robo_ovl_t *h, float opacity);
+
+// Destroy overlay and free resources.
+int robo_overlay_destroy(robo_ovl_t *h);
+
+// ---------------------------------------------------------------------
+// Virtual device API (optional; requires privileged helper or driver).
+// Use JSON for device capabilities in create call.
+// ---------------------------------------------------------------------
+
+// Create a virtual mouse/keyboard device. cfg_json describes HID descriptor & capabilities.
+// On success returns 0 and sets *dev.
+int robo_vdev_create(robo_ctx_t *ctx, const char *cfg_json, robo_dev_t **dev);
+
+// Send pre-encoded HID report (binary buffer) to virtual device.
+// report: pointer to report bytes; len: report length.
+// If driver uses batching/mmap, this will write into ring and ring doorbell.
+int robo_vdev_send_report(robo_dev_t *dev, const uint8_t *report, size_t len);
+
+// Convenience functions for mouse/key if not using raw reports:
+int robo_vdev_send_mouse_abs(robo_dev_t *dev, int x, int y, uint32_t buttons);
+int robo_vdev_send_key(robo_dev_t *dev, uint16_t usage, bool down);
+
+// Destroy virtual device.
+int robo_vdev_destroy(robo_dev_t *dev);
+
+// ---------------------------------------------------------------------
+// Window-targeted injection (best effort; unprivileged path).
+// ---------------------------------------------------------------------
+
+// window_id: platform-specific window identifier string.
+// flags: e.g., send_mouse_move | send_mouse_button | send_absolute_coords
+int robo_window_send_mouse(robo_ctx_t *ctx, const char *window_id, int x, int y, uint32_t flags);
+int robo_window_send_key(robo_ctx_t *ctx, const char *window_id, uint16_t code, bool down);
+
+// ---------------------------------------------------------------------
+// Batch submission API (userland-first batching; helpful for unprivileged helper fallbacks).
+// ---------------------------------------------------------------------
+
+// Begin a batch: returns a batch handle (opaque) or NULL on error.
+int robo_batch_begin(robo_ctx_t *ctx, void **batch_handle);
+
+// Add pre-encoded HID report to batch (copied into batch).
+int robo_batch_add_report(void *batch_handle, const uint8_t *report, size_t len);
+
+// Submit batch to device (or window/injector). This can be synchronous or asynchronous.
+// If using privileged helper this will copy pointers into mmaped region and ring doorbell.
+// If not, it will fallback to many syscalls (but try to coalesce).
+int robo_batch_submit(void *batch_handle, int flags);
+
+// Free batch resources
+void robo_batch_end(void *batch_handle);
+```
+
+**Error codes (examples):**
+
+* `ROBO_OK` = 0
+* `ROBO_ERR_INVALID_ARG` = -1
+* `ROBO_ERR_NO_PRIVILEGE` = -2
+* `ROBO_ERR_NOT_FOUND` = -3
+* `ROBO_ERR_IO` = -4
+* `ROBO_ERR_NOMEM` = -5
+* `ROBO_ERR_TIMEOUT` = -6
+
+(Provide header `robo_error.h` documenting all codes and mapping to strerror style function `const char *robo_strerror(int code)`.)
+
+---
+
+# 4. IPC and Driver Protocol (detailed)
+
+## 4.1 Goals for driver protocol
+
+* Minimal syscalls per batch (one doorbell ioctl / eventfd write).
+* Zero-copy where possible: mmap ring buffer visible to both user and driver.
+* Small, deterministic data layout: fixed-size report slots or length-prefixed but aligned entries.
+* Simple authentication / capability checks on connection open (e.g., unix domain socket credentials or Windows named pipe auth).
+* Fallback safe: if helper absent, userland will fallback to one-shot syscalls.
+
+## 4.2 Shared ring buffer layout (canonical)
+
+Design a cache-friendly ring buffer that stores fixed-size slots to simplify driver consumption.
+
+**Constants:**
+
+```c
+#define ROBO_RING_MAGIC 0x52424F30 // 'RBO0'
+#define ROBO_MAX_SLOTS  4096       // tuneable; power of two preferred
+#define ROBO_SLOT_SIZE  64         // default slot size in bytes; must be >= largest HID report
+```
+
+**Header struct in mmap region (all fields little-endian):**
+
+```c
+struct robo_ring_hdr {
+    uint32_t magic;        // ROBO_RING_MAGIC
+    uint32_t version;      // Protocol version
+    uint32_t slot_count;   // number of slots
+    uint32_t slot_size;    // bytes
+    uint64_t prod_index;   // producer write index (64-bit to avoid wrap issues)
+    uint64_t cons_index;   // consumer read index
+    uint32_t flags;        // reserved
+    uint8_t  reserved[56]; // pad to 128 bytes
+};
+```
+
+Followed by `slot_count * slot_size` bytes of slot storage.
+
+**Slot format (length-prefixed):**
+
+```
+offset 0: uint16_t len;
+offset 2: uint16_t flags;
+offset 4: payload (len bytes), padded to slot_size.
+```
+
+**Producer algorithm (userland):**
+
+1. Read `hdr->prod_index` & `hdr->cons_index` (atomic reads).
+2. `free = slot_count - (prod_index - cons_index)`. If free == 0, handle full ring (spin/backoff or return busy).
+3. Reserve `idx = prod_index % slot_count` and increment prod_index atomically (e.g., atomic_fetch_add).
+4. Write report length & payload into slot at `idx`.
+5. Optionally write memory barrier.
+6. Once batch of N reports placed, ring doorbell: write to `eventfd`, or `ioctl(BATCH_READY, offset,count)` or `DeviceIoControl` with no payload — just notification.
+
+**Consumer (driver/helper):**
+
+* Wait on doorbell or busy-poll.
+* Read `prod_index` and `cons_index` to see new entries.
+* Consume slot entries in order, process HID reports (driver copies to device).
+* Update `cons_index` and continue.
+
+## 4.3 Doorbell primitives (per-OS)
+
+* **Linux (preferred):** `eventfd` — user performs `eventfd_write(fd, 1)` after filling ring; kernel/helper `epoll`/`poll`/read` on eventfd.
+* **Linux alternate:** `ioctl(fd, IOCTL_SUBMIT, &params)` where params include offset/count.
+* **Windows:** `DeviceIoControl(hDevice, IOCTL_ROBO_BATCH, NULL,0, NULL,0, &bytes, &ovl)` or use `NtSetEvent` on kernel event object; user can `SetEvent` on mapped event handle; or `WaitOnAddress` combined with a minimal kernel signal if driver supports.
+* **macOS:** DriverKit userclient `IOConnectMethod` for doorbell or `IOSharedDataQueue/IOSharedInterrupt` pattern.
+
+## 4.4 IOCTLs and indices (example Linux ioctl numbers)
+
+(These numeric values are examples; real driver must use unique IOCTLs with `ioctl` macros.)
+
+```c
+#define ROBO_IOC_MAGIC 'R'
+#define ROBO_IOC_CONNECT _IOW(ROBO_IOC_MAGIC, 1, struct robo_connect)
+#define ROBO_IOC_SUBMIT  _IOW(ROBO_IOC_MAGIC, 2, struct robo_submit) // offset,count
+#define ROBO_IOC_PING    _IO(ROBO_IOC_MAGIC, 3)
+```
+
+`struct robo_submit { uint32_t offset; uint32_t count; };`
+
+Driver must validate offset/count and permissioned mmaps.
+
+---
+
+# 5. Batching strategies & tradeoffs
+
+**Why batch?** Syscall or ioctl overhead is roughly fixed per call; batching N events reduces per-event overhead by approx 1/N.
+
+**Batching options:**
+
+1. **Userland-only batching:** Build an in-memory batch vector and do a single `write(fd, buf, buf_size)` to `/dev/uinput`. Works without privileged helpers. Simpler but copies from user buffer to kernel buffer.
+
+2. **mmap + doorbell (zero-copy):** User writes into shared ring slot memory and signals kernel with eventfd/ioctl/DeviceIoControl. Kernel/driver reads directly: minimal copies, minimal syscalls.
+
+3. **Hybrid:** For systems without driver, fallback to userland-batched write.
+
+**Batch size tuning:**
+
+* Tradeoff: bigger batches → better throughput but higher worst-case latency for earliest event in batch. Choose batch size dynamically based on latency budget and throughput needs.
+* Typical default: 32–1024 events per batch; allow user-configurable via `config_json`.
+
+**Atomicity & ordering:**
+
+* Maintain FIFO ordering. Use atomic 64-bit counters for `prod_index` and `cons_index` to avoid ambiguity.
+
+---
+
+# 6. Pre-encoded HID reports & report packing
+
+* Users must pre-encode HID reports in the exact binary layout the driver expects (size must be <= slot_size).
+* Keep report sizes small and consistent (e.g., 8–64 bytes). Avoid variable-length unpredictability.
+* Support report pooling: recycle report buffers to avoid allocations in hot loops.
+* Provide helper functions to pack common reports:
+
+  * `pack_mouse_report(uint8_t *out, int x, int y, uint8_t buttons)`
+  * `pack_keyboard_report(uint8_t *out, uint16_t usage, bool down)`
+* Provide optional compression for extremely dense event streams (only if both sides support it), but this complicates driver design—avoid for first PoC.
+
+---
+
+# 7. Real-time threads & scheduling
+
+* Provide API/hooks to mark threads as real-time and pin to CPU affinity:
+
+  * Linux: `pthread_setschedparam` with `SCHED_FIFO` and `sched_setaffinity`.
+  * Windows: `SetThreadPriority`, `SetThreadAffinityMask`, enable real-time privileges if needed.
+  * macOS: real-time APIs (limited), adjust QoS appropriately.
+
+* Recommended approach:
+
+  * Separate **injection thread** (handles ring writes and doorbell).
+  * Separate **compositor thread** (overlay GPU submission).
+  * Pin these two threads to separate CPU cores; do not overload them with other work.
+  * Provide safety: if program runs in lower-privilege environment or user refuses to grant priorities, degrade gracefully.
+
+---
+
+# 8. Overlay rendering & GPU integration
+
+**Objectives:**
+
+* Per-monitor transparent overlays with alpha blending.
+* GPU acceleration and partial updates.
+* Support minimized windows by using GPU or driver overlay planes where possible.
+
+**Implementation choices (platform):**
+
+* **Windows:** DirectComposition + DXGI swapchain overlay planes, Direct3D 11/12 for rendering; use DirectComposition's per-window / per-monitor overlays where available.
+* **Linux:** X11 OpenGL overlay window or Wayland/DRM/KMS direct scanout; use DRM atomic modesetting and plane support for minimal compositor overhead.
+* **macOS:** CoreAnimation + Metal layers; DriverKit overlay planes where available.
+
+**Per-monitor overlay strategy:**
+
+* Create per-monitor overlay surfaces so updates affect only the target monitor.
+* Use triple-buffering and GPU fences to avoid stalls.
+* Keep overlay textures small and update only changed regions.
+
+**Minimized windows:**
+
+* If the overlay must be visible while target window minimized, draw overlay in a top-level borderless transparent window or render through driver-level overlay plane (preferred for minimal compositor interaction).
+* On systems where overlay cannot be above other windows due to compositor constraints, provide "headless" operation where injection can still happen even if overlay not visible.
+
+---
+
+# 9. Windows-specific design details
+
+* **Shared memory:** `CreateFileMapping` + `MapViewOfFile` to share ring buffer with a privileged service or kernel-mode driver.
+* **Doorbell:** `DeviceIoControl` with a small input buffer or `SetEvent` on a kernel event handle.
+* **Driver:** Optionally KMDF driver (signed) or a user-space service that interfaces with a signed driver. Consider user-mode helper for easier development: Windows service with SeCreateSymbolicLinkPrivilege and ability to open `\\.\uinput-like` device.
+* **Input injection alternatives:** `SendInput()` (unprivileged), `PostMessage()`/`SendMessage()` targeting windows, or a virtual HID driver using UMDF/Kernel HID stack.
+
+---
+
+# 10. Linux-specific design details
+
+* **Preferred path:** userland library to privileged helper binary/daemon that exposes `mmap()` region (via `mmap` on special fd) and an `eventfd` for doorbell, and a small set of ioctls for control.
+* **uinput fallback:** If helper absent, library can assemble large `input_event` arrays and perform a single `write(fd_uinput, buf, buf_size)` with thousands of events (uinput supports writing arrays). This is simpler but involves copy.
+* **DRM/KMS overlay:** When possible use DRM planes for per-monitor overlays (requires root or direct rendering access).
+* **Security:** Helper should expose only necessary functions, drop privileges asap, and validate credentials via `SO_PEERCRED` on unix sockets.
+
+---
+
+# 11. macOS-specific design details
+
+* **DriverKit / IOHIDUserDevice:** Use DriverKit userclient that exposes memory via `IOConnectMapMemory64` for minimal copies. Requires DriverKit entitlements and notarization for distribution.
+* **Overlay:** Use CoreGraphics + Metal for high-performance overlay rendering. For user-mode helper, provide a service to communicate with user app.
+* **Security & signing:** Must sign and notarize any privileged helper; prefer user-consented Installers.
+
+---
+
+# 12. Minimal First Deliverable — Linux PoC (very specific)
+
+**Targets:**
+
+* `core/` : C implementation of ring buffer, batch APIs, scheduler, tests.
+* `backend-linux/`:
+
+  * **Overlay renderer:** X11/OpenGL (per-monitor), fallback to draw in a borderless window.
+  * **uinput write-batching demo:** show `write(fd_uinput, buf, buf_size)` for N events.
+  * **Privileged helper (daemon):** exposes:
+
+    * `/dev/robo_helper` device or unix domain socket to negotiate.
+    * `mmap()`ed shared ring buffer with proper header.
+    * `eventfd` doorbell or small `ioctl` to signal.
+* `bindings/python/` : CFFI wrapper for basic operations.
+* Examples:
+
+  * `overlay_demo` — shows visual cursor only.
+  * `batch_injector` — fills ring or buffer with thousands of events and submits once, measures latency.
+
+**Concrete PoC API (C code snippets)**
+
+*Ring buffer init (user side):*
+
+```c
+// open helper (unix socket) and receive fd for mmap
+int robo_helper_connect(const char *sockpath, int *out_mmap_fd, int *out_eventfd);
+
+// mmap the ring
+void *ring = mmap(NULL, ring_size, PROT_READ|PROT_WRITE, MAP_SHARED, mmap_fd, 0);
+
+// write slot function
+bool ring_write_report(struct robo_ring_hdr *hdr, const uint8_t *report, uint16_t len) {
+    uint64_t prod = atomic_load(&hdr->prod_index);
+    uint64_t cons = atomic_load(&hdr->cons_index);
+    uint64_t free = hdr->slot_count - (prod - cons);
+    if (free == 0) return false; // ring full
+    uint32_t idx = prod & (hdr->slot_count - 1);
+    uint8_t *slot = get_slot_ptr(hdr, idx);
+    memcpy(slot+4, report, len);
+    *(uint16_t*)(slot+0) = len;
+    atomic_fetch_add(&hdr->prod_index, 1);
+    return true;
+}
+```
+
+*Doorbell:*
+
+```c
+// after writing N reports:
+uint64_t one = 1;
+write(eventfd_fd, &one, sizeof(one));  // eventfd
+// or ioctl(helper_fd, ROBO_IOC_SUBMIT, &params)
+```
+
+*Driver/helper reads:*
+
+* `poll()` on eventfd; on wake, read `hdr->cons_index`..`hdr->prod_index`, process reports, update `cons_index`.
+
+**Testing plan for PoC:**
+
+* Microbenchmark: compare per-event `write()` vs batched `write()` vs mmap+doorbell latency & throughput.
+* Tools: measure with `clock_gettime(CLOCK_MONOTONIC_RAW, &ts)` per-event latencies and end-to-end jitter.
+
+---
+
+# 13. Bindings & packaging
+
+* Produce a portable dynamic library: `.so`, `.dll`, `.dylib`.
+* Provide language wrappers:
+
+  * **Python**: CFFI + wheel with manylinux build for Linux, wheel for macOS and Windows.
+  * **Node**: N-API native module built via `node-gyp` or `cmake-js`.
+  * **C#**: P/Invoke wrapper and NuGet package.
+* CI: GitHub Actions or equivalent matrix for Linux (ubuntu), Windows (MSVC), macOS (xcode) builds. Cross-compile where appropriate.
+* Release artifacts: tar.gz for core, wheels, npm package, and NuGet.
+
+---
+
+# 14. Security & safety (detailed)
+
+**Principles:**
+
+* Least privilege: privileged helper only performs device-facing operations; otherwise library operates unprivileged.
+* Authentication:
+
+  * Linux: use `SO_PEERCRED` or filesystem permissions for unix socket. Helper must validate UID/GID.
+  * Windows: use ACLs and named pipe security or service SCM to restrict clients.
+* Validate all inputs: length fields, indices, offsets. Reject malformed reports.
+* Avoid elevation-of-privilege windows: privileged helper should drop extra capabilities after creating the device.
+* Auditable: keep helper code minimal and easily auditable; prefer user-space helper over kernel driver for initial PoC.
+* Signed drivers and notarization: Mandatory on Windows (KMDF driver signing) and macOS (notarization).
+* Logging: use configurable log levels; do not log sensitive payloads (e.g., keystrokes) unless explicitly enabled for debugging with consent.
+
+---
+
+# 15. Testing & QA (concrete list)
+
+**Unit tests:**
+
+* ring buffer correctness (wrap, overflow, underflow).
+* batch APIs: batch begin/add/submit semantics.
+* error conditions: invalid args, null handles, insufficient memory.
+
+**Integration tests:**
+
+* overlay create/destroy on each platform.
+* uinput write batching (Linux): write 1k events, verify device receives them in order.
+* virtual device path: create vdev and send reports, verify system receives events.
+
+**Performance tests / benchmarks:**
+
+* latency (µs): per-event syscall vs batched write (N=1,4,16,64,256,1024) vs mmap+doorbell.
+* throughput (events/sec) measured under different CPU/affinity conditions.
+* jitter: measure standard deviation of latency under system load.
+
+**Stress tests:**
+
+* ring buffer wrap-around heavy use.
+* producer faster than consumer with backpressure simulation.
+* simulate helper crash & library fallback behavior.
+
+**Security tests:**
+
+* unauthorized access attempts to helper socket/device.
+* malformed report injection.
+* bounds / overflow fuzzing on ring write/read.
+
+**CI tasks:**
+
+* Unit tests run on every PR.
+* Integration tests run nightly or on demand (since hardware interactions may need environment).
+* Release pipeline: build artifacts + run smoke tests on each OS.
+
+---
+
+# 16. Performance micro-optimizations & engineering details
+
+* **Memory placement:** allocate ring buffer with `posix_memalign` to cache-line boundary where applicable.
+* **Slot sizing:** choose slot size to match typical report size and align to cache line to reduce false sharing.
+* **Avoid locks:** use atomic counters for ring indexes and only use lock when absolutely needed.
+* **Batch coalescing:** implement adaptive batching: small bursts -> small batch; sustained stream -> larger batches.
+* **Use of SIMD/intrinsics:** use SIMD for cursor alpha blending and repeated transformations (use platform intrinsics, with runtime CPU dispatch).
+* **Prefetching:** prefetch next slot on consumer side if busy-polling.
+* **Busy-poll option:** expose config flag to enable busy-poll on driver side (for low-latency scenarios) with a CPU usage cap.
+* **Minimize context switches:** keep producer/consumer pinned and avoid syscalls per event.
+
+---
+
+# 17. Example usage (C and Python)
+
+**C example (simplified):**
+
+```c
+robo_ctx_t *ctx;
+int rc = robo_init(NULL, &ctx);
+if (rc) { fprintf(stderr, "init failed\n"); return 1; }
+
+// create virtual device
+robo_dev_t *dev;
+rc = robo_vdev_create(ctx, "{\"type\":\"mouse\",\"abs\":true}", &dev);
+
+// pack report (platform-specific report size)
+uint8_t report[8];
+pack_mouse_report(report, 150, 200, 0);
+robo_vdev_send_report(dev, report, sizeof(report));
+
+// cleanup
+robo_vdev_destroy(dev);
+robo_shutdown(ctx);
+```
+
+**Python (binding) example:**
+
+```python
+from robo import Robo
+
+r = Robo.init({"log_level": "info"})
+overlay = r.create_overlay(monitor="primary")
+overlay.set_cursor_image(bytes_rgba, w, h, hotspot_x=0, hotspot_y=0)
+overlay.move(100,200)
+
+# privileged path if helper present
+dev = r.create_virtual_mouse({"name":"robo-mouse","abs":True})
+dev.send_mouse_abs(150,250, buttons=0)
+r.shutdown()
+```
+
+---
+
+# 18. Release & Versioning
+
+* Use semantic versioning: `MAJOR.MINOR.PATCH`.
+* Strong guarantee: C ABI is stable across minor versions. Break ABI only on major versions.
+* Tag releases in git; produce changelog including any driver version changes.
+* For drivers, release driver package separately with exact driver version mapping to core library version.
+
+---
+
+# 19. Project structure (concrete tree)
+
+```
+Root/
+├─ README.md
+├─ LICENSE
+├─ docs/
+│   ├─ design.md
+│   ├─ protocol.md
+│   └─ api_reference.md
+├─ core/
+│   ├─ ring.c/h
+│   ├─ batch.c/h
+│   ├─ realtime.c/h
+│   └─ CMakeLists.txt
+├─ abi/
+│   ├─ robo.h       // public C header
+│   └─ robo_error.h
+├─ backends/
+│   ├─ backend-linux/
+│   │   ├─ overlay_x11.c
+│   │   ├─ uinput_batch.c
+│   │   └─ helper_client.c
+│   ├─ backend-windows/
+│   └─ backend-macos/
+├─ drivers/
+│   ├─ linux-helper/      // user-space helper (systemd unit)
+│   ├─ windows-driver/    // KMDF project (skeleton)
+│   └─ macos-driver/      // DriverKit skeleton
+├─ bindings/
+│   ├─ python/
+│   ├─ node/
+│   └─ dotnet/
+├─ examples/
+│   ├─ overlay_demo/
+│   └─ batch_injector/
+├─ tests/
+│   ├─ unit/
+│   └─ integration/
+└─ ci/
+    └─ github-actions.yml
+```
+
+---
+
+# 20. Roadmap & milestones (suggested, concrete)
+
+**Milestone 0 — Repo + basic core**
+
+* Create repo skeleton, `robo.h` header, core ring buffer implementation, unit tests.
+* Estimated local effort: small (days of dev, but you requested no time estimates — I provide list only).
+
+**Milestone 1 — Linux PoC**
+
+* Implement `backend-linux/uinput_batch.c` (batched write).
+* Implement `drivers/linux-helper` (user-space daemon exposing mmap + eventfd).
+* Implement Python binding for demo.
+* Provide `overlay_demo` and `batch_injector`.
+
+**Milestone 2 — Windows backend**
+
+* Implement CreateFileMapping based shared mem, DeviceIoControl doorbell example.
+* Implement Windows overlay (DComp/D3D).
+* Provide Node and C# wrapper skeletons.
+
+**Milestone 3 — macOS**
+
+* DriverKit userclient skeleton + overlay.
+
+**Milestone 4 — polish**
+
+* Packaging (wheels, npm, NuGet), CI, docs, security audit, testing matrix.
+
+(If you want, I can turn this roadmap into an exact checklist file in the repo now.)
+
+---
+
+# 21. Testing plan templates & commands (Linux PoC examples)
+
+**Microbenchmark (per-event syscall vs batched write vs mmap):**
+
+* Use `clock_gettime(CLOCK_MONOTONIC_RAW, ...)` around send path.
+* Run scenarios:
+
+  * Per-event `write(fd_uinput, &ev, sizeof(ev))` 1M events.
+  * Batched `write(fd_uinput, events, N*sizeof(ev))` for N values.
+  * mmap ring fill of N events then `eventfd_write` and measure end-to-end latency.
+
+**Stress test runner:**
+
+```bash
+# run helper
+sudo ./drivers/linux-helper/daemon --device /dev/uinput &
+
+# run injector (user)
+./examples/batch_injector --events 100000 --batch-size 256
+```
+
+**Check results:**
+
+* Observe `/proc/interrupts`, iostat, and CPU usage.
+* Use `evtest` or `libinput-debug-events` to verify events seen by system.
+
+---
+
+# 22. Documentation & support artifacts
+
+* `docs/design.md` — overall design rationale.
+* `docs/protocol.md` — detailed ring format, ioctl definitions, doorbell semantics.
+* `docs/security.md` — threat model and mitigations.
+* `docs/api_reference.md` — full public API with signatures and examples.
+* Example code in `examples/` for quick start.
+
+---
+
+# 23. Known limitations & caveats (transparent)
+
+* **Platform restrictions:** Driver-based zero-copy requires privileged helper/driver and may require code signing and platform-specific distribution steps.
+* **Not a magic bypass:** Some OSes disallow certain injection methods without higher privileges or explicit user consent; the library will provide graceful fallback but cannot circumvent OS security policies.
+* **Busy-poll CPU cost:** Busy-polling reduces latencies but increases CPU usage; provide configuration to tune this.
+* **Driver signing & notarization overhead:** Windows KMDF signing and macOS DriverKit notarization add release complexity and cost.
+* **ABI stability responsibility:** C ABI must be carefully managed; internal refactors should not change exported headers without bumping major version.
+
+---
+
+# 24. Security & compliance checklist (for release)
+
+* Harden helper: drop privileges, chroot where possible, set secure file permissions.
+* Sign binaries and drivers.
+* Audit code paths that handle keyboard inputs (consider privacy and legal implications).
+* Add telemetry opt-in/out only, avoid collecting keystroke contents.
+* Provide clear EULA and instructions for responsible use.
+
+---
+
+# 25. Appendices — Useful example structs & constants
+
+**Example `robo.h` excerpt:**
+
+```c
+#ifndef ROBO_H
+#define ROBO_H
+#include <stdint.h>
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct robo_ctx_t robo_ctx_t;
+typedef struct robo_dev_t robo_dev_t;
+typedef struct robo_ovl_t robo_ovl_t;
+
+int robo_init(const char *config_json, robo_ctx_t **ctx);
+void robo_shutdown(robo_ctx_t *ctx);
+int robo_overlay_create(robo_ctx_t *ctx, const char *monitor_spec, robo_ovl_t **out);
+int robo_overlay_set_cursor_image(robo_ovl_t *h, const uint8_t *rgba, int w, int h, int hotspot_x, int hotspot_y);
+int robo_overlay_move(robo_ovl_t *h, int x, int y);
+int robo_overlay_destroy(robo_ovl_t *h);
+int robo_vdev_create(robo_ctx_t *ctx, const char *cfg_json, robo_dev_t **dev);
+int robo_vdev_send_report(robo_dev_t *dev, const uint8_t *report, size_t len);
+int robo_vdev_destroy(robo_dev_t *dev);
+int robo_batch_begin(robo_ctx_t *ctx, void **batch_handle);
+int robo_batch_add_report(void *batch_handle, const uint8_t *report, size_t len);
+int robo_batch_submit(void *batch_handle, int flags);
+void robo_batch_end(void *batch_handle);
+
+#ifdef __cplusplus
+}
+#endif
+#endif // ROBO_H
+```
+
